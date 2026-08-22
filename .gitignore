@@ -1,0 +1,10 @@
+# Generated files
+results.html
+results.json
+search.log
+
+# Config with secrets (use config.example.json as template)
+config.json
+
+# Claude Code
+.claude/

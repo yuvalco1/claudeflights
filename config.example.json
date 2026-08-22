@@ -1,0 +1,12 @@
+{
+  "origin": "TLV",
+  "destination": "BKK",
+  "departure_date": "2027-04-09",
+  "return_date": "2027-04-23",
+  "passengers": 2,
+  "max_stops": "ONE_STOP",
+  "currency": "USD",
+  "top_n": 3,
+  "telegram_bot_token": "",
+  "telegram_chat_id": ""
+}
