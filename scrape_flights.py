@@ -18,6 +18,18 @@ AIRPORT_ENTITIES = {
 
 
 def scrape(config: dict) -> list[dict]:
+    origin = config["origin"]
+    destinations = config.get("destinations", [config.get("destination", "BKK")])
+    dep_date = config["departure_date"]
+    ret_date = config["return_date"]
+    passengers = config.get("passengers", 1)
+    max_stops = _max_stops_int(config.get("max_stops", "ANY"))
+    max_layover = config.get("max_layover_minutes")
+    currency = config.get("currency", "USD")
+    top_n = config.get("top_n", 3)
+    dep_year = int(dep_date[:4])
+    ret_year = int(ret_date[:4])
+
     with sync_playwright() as pw:
         browser = pw.chromium.launch(
             headless=True,
@@ -37,7 +49,38 @@ def scrape(config: dict) -> list[dict]:
             "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
         )
         try:
-            return _run_search(page, config)
+            combos = [(od, ro) for od in destinations for ro in destinations]
+            total = len(combos)
+            all_results = []
+            consent_dismissed = False
+
+            for idx, (out_dest, ret_origin) in enumerate(combos):
+                print(f"  [{idx+1}/{total}] {origin}->{out_dest} / {ret_origin}->{origin}...", end="", flush=True)
+
+                try:
+                    result = _search_combo(
+                        page, origin, out_dest, ret_origin,
+                        dep_date, ret_date, passengers, max_stops,
+                        max_layover, currency, dep_year, ret_year,
+                        dismiss_consent=not consent_dismissed,
+                    )
+                    consent_dismissed = True
+                except Exception as e:
+                    print(f" error: {e}")
+                    _pause(10, 20)
+                    continue
+
+                if result:
+                    all_results.append(result)
+                    print(f" ${result['price']} ({result['outbound_airline']}/{result['inbound_airline']})")
+                else:
+                    print(" no results")
+
+                if idx < total - 1:
+                    _pause(5, 12)
+
+            all_results.sort(key=lambda r: r["price"])
+            return all_results[:top_n]
         finally:
             browser.close()
 
@@ -80,13 +123,13 @@ def _encode_airport(field_num, iata):
     return _pb_bytes(field_num, inner)
 
 
-def _build_tfs(dep_date, ret_date, origin, dest, passengers=1):
+def _build_tfs(dep_date, ret_date, origin, out_dest, ret_origin, passengers=1):
     tfs = b""
     tfs += _pb_varint(1, 28)
     tfs += _pb_varint(2, 2)  # multi-city
-    seg1 = _pb_string(2, dep_date) + _encode_airport(13, origin) + _encode_airport(14, dest)
+    seg1 = _pb_string(2, dep_date) + _encode_airport(13, origin) + _encode_airport(14, out_dest)
     tfs += _pb_bytes(3, seg1)
-    seg2 = _pb_string(2, ret_date) + _encode_airport(13, dest) + _encode_airport(14, origin)
+    seg2 = _pb_string(2, ret_date) + _encode_airport(13, ret_origin) + _encode_airport(14, origin)
     tfs += _pb_bytes(3, seg2)
     tfs += _pb_varint(8, 1)
     tfs += _pb_varint(9, 1)
@@ -97,15 +140,8 @@ def _build_tfs(dep_date, ret_date, origin, dest, passengers=1):
     return base64.urlsafe_b64encode(tfs).rstrip(b"=").decode()
 
 
-def _build_search_url(config):
-    tfs = _build_tfs(
-        config["departure_date"],
-        config["return_date"],
-        config["origin"],
-        config["destination"],
-        config.get("passengers", 1),
-    )
-    currency = config.get("currency", "USD")
+def _build_search_url(dep_date, ret_date, origin, out_dest, ret_origin, passengers=1, currency="USD"):
+    tfs = _build_tfs(dep_date, ret_date, origin, out_dest, ret_origin, passengers)
     return f"https://www.google.com/travel/flights/search?tfs={tfs}&tfu=KgIIAw&hl=en&curr={currency}"
 
 
@@ -221,7 +257,7 @@ _JS_EXTRACT = """() => {
 }"""
 
 
-def _extract_flights(page, max_stops, year):
+def _extract_flights(page, max_stops, year, max_layover=None):
     raw = page.evaluate(_JS_EXTRACT)
     flights = []
     for item in raw:
@@ -230,6 +266,9 @@ def _extract_flights(page, max_stops, year):
             continue
         if max_stops is not None and parsed["stops"] > max_stops:
             continue
+        if max_layover is not None and parsed["layovers"]:
+            if any(lo["duration"] > max_layover for lo in parsed["layovers"]):
+                continue
         flights.append(parsed)
     flights.sort(key=lambda f: f["total_price"])
     return flights
@@ -318,30 +357,29 @@ def _build_segment(flight: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Main search flow
+# Search one destination combination
 # ---------------------------------------------------------------------------
 
-def _run_search(page, config):
-    currency = config.get("currency", "USD")
-    dep_date = config["departure_date"]
-    ret_date = config["return_date"]
-    passengers = config.get("passengers", 1)
-    max_stops = _max_stops_int(config.get("max_stops", "ANY"))
-    top_n = config.get("top_n", 3)
-    dep_year = int(dep_date[:4])
-    ret_year = int(ret_date[:4])
-
-    # 1. Navigate directly to search results URL
-    url = _build_search_url(config)
-    page.goto(url, wait_until="networkidle", timeout=30000)
+def _search_combo(page, origin, out_dest, ret_origin,
+                  dep_date, ret_date, passengers, max_stops,
+                  max_layover, currency, dep_year, ret_year,
+                  dismiss_consent=True):
+    url = _build_search_url(dep_date, ret_date, origin, out_dest, ret_origin, passengers, currency)
+    try:
+        page.goto(url, wait_until="networkidle", timeout=30000)
+    except PlaywrightTimeout:
+        try:
+            page.wait_for_load_state("domcontentloaded", timeout=10000)
+        except Exception:
+            return None
     _pause(2, 3)
-    _dismiss_consent(page)
 
-    # 2. Wait for outbound results
+    if dismiss_consent:
+        _dismiss_consent(page)
+
     if not _wait_for_results(page):
-        return []
+        return None
 
-    # 3. Set passengers if needed
     if passengers > 1:
         if _set_passengers(page, passengers):
             page.wait_for_load_state("networkidle", timeout=15000)
@@ -350,72 +388,39 @@ def _run_search(page, config):
 
     _pause(1, 2)
 
-    # 4. Parse outbound flights
-    outbound_flights = _extract_flights(page, max_stops, dep_year)
+    outbound_flights = _extract_flights(page, max_stops, dep_year, max_layover)
     if not outbound_flights:
-        return []
+        return None
 
-    # 5. For each top outbound, click to get return flights
-    explore_count = min(len(outbound_flights), top_n + 2)
-    results = []
+    cards = page.locator("li.pIav2d")
+    if cards.count() == 0:
+        return None
 
-    for i in range(explore_count):
-        try:
-            cards = page.locator("li.pIav2d")
-            card_count = cards.count()
-            if i >= card_count:
-                break
+    cards.first.click(force=True)
+    _pause(3, 4)
 
-            cards.nth(i).click(force=True)
-            _pause(3, 4)
+    try:
+        page.wait_for_selector("li.pIav2d", timeout=15000)
+    except PlaywrightTimeout:
+        return None
 
-            try:
-                page.wait_for_selector("li.pIav2d", timeout=15000)
-            except PlaywrightTimeout:
-                try:
-                    page.go_back()
-                    _pause(2, 3)
-                except Exception:
-                    pass
-                continue
+    return_flights = _extract_flights(page, max_stops, ret_year, max_layover)
+    if not return_flights:
+        return None
 
-            return_flights = _extract_flights(page, max_stops, ret_year)
-            if return_flights:
-                ret = return_flights[0]
-                results.append(
-                    {
-                        "price": ret["total_price"],
-                        "currency": currency,
-                        "outbound_airline": outbound_flights[i]["airline"],
-                        "inbound_airline": ret["airline"],
-                        "outbound": _build_segment(outbound_flights[i]),
-                        "inbound": _build_segment(ret),
-                    }
-                )
+    out = outbound_flights[0]
+    ret = return_flights[0]
 
-            page.go_back()
-            _pause(1, 2)
-            try:
-                page.wait_for_selector("li.pIav2d", timeout=20000)
-            except PlaywrightTimeout:
-                page.reload()
-                _pause(2, 3)
-                if not _wait_for_results(page):
-                    break
-            _pause(0.5, 1.5)
-        except PlaywrightTimeout:
-            try:
-                page.go_back()
-                _pause(2, 3)
-                page.wait_for_selector("li.pIav2d", timeout=10000)
-            except Exception:
-                pass
-            continue
-        except Exception:
-            continue
-
-    results.sort(key=lambda r: r["price"])
-    return results[:top_n]
+    return {
+        "price": ret["total_price"],
+        "currency": currency,
+        "outbound_dest": out_dest,
+        "return_origin": ret_origin,
+        "outbound_airline": out["airline"],
+        "inbound_airline": ret["airline"],
+        "outbound": _build_segment(out),
+        "inbound": _build_segment(ret),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -423,37 +428,15 @@ if __name__ == "__main__":
     cfg_path = Path(__file__).parent / "config.json"
     with open(cfg_path, encoding="utf-8") as f:
         cfg = json.load(f)
-    print(f"Scraping flights: {cfg['origin']}->{cfg['destination']} "
-          f"{cfg['departure_date']} to {cfg['return_date']}...")
 
-    debug = "--debug" in sys.argv
-    with sync_playwright() as pw:
-        browser = pw.chromium.launch(
-            headless=not debug,
-            args=["--disable-blink-features=AutomationControlled"],
-        )
-        ctx = browser.new_context(
-            viewport={"width": 1280, "height": 800},
-            locale="en-US",
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/131.0.0.0 Safari/537.36"
-            ),
-        )
-        page = ctx.new_page()
-        page.add_init_script(
-            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
-        )
-        try:
-            flights = _run_search(page, cfg)
-            if flights:
-                print(json.dumps(flights, indent=2))
-            else:
-                print("No flights found.")
-                if debug:
-                    page.screenshot(path="debug_screenshot.png")
-                    print("Screenshot saved to debug_screenshot.png")
-                    print(f"Current URL: {page.url}")
-        finally:
-            browser.close()
+    dests = cfg.get("destinations", [cfg.get("destination", "BKK")])
+    print(f"Scraping flights: {cfg['origin']}->{','.join(dests)} "
+          f"{cfg['departure_date']} to {cfg['return_date']} "
+          f"({len(dests)}x{len(dests)}={len(dests)**2} combos)...")
+
+    flights = scrape(cfg)
+    if flights:
+        print(f"\nTop {len(flights)} results:")
+        print(json.dumps(flights, indent=2))
+    else:
+        print("No flights found.")

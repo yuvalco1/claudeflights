@@ -28,8 +28,11 @@ def load_config() -> dict:
         return json.load(f)
 
 
-def google_flights_url(config: dict) -> str:
-    q = f"flights from {config['origin']} to {config['destination']} on {config['departure_date']} return {config['return_date']}"
+def google_flights_url(config: dict, dest: str = None) -> str:
+    if dest is None:
+        dests = config.get("destinations", [config.get("destination", "BKK")])
+        dest = dests[0]
+    q = f"flights from {config['origin']} to {dest} on {config['departure_date']} return {config['return_date']}"
     return f"https://www.google.com/travel/flights?q={urllib.parse.quote(q)}&curr={config.get('currency', 'USD')}"
 
 
@@ -94,9 +97,18 @@ def build_segment_html(label: str, segment: dict, airline_name: str) -> str:
 
 
 def build_html(flights: list[dict], config: dict, search_time: str) -> str:
+    dests = config.get("destinations", [config.get("destination", "BKK")])
+    dest_label = ", ".join(dests)
     gf_url = google_flights_url(config)
+    max_layover = config.get("max_layover_minutes")
+    layover_note = f" &middot; max {max_layover // 60}h layover" if max_layover else ""
     cards = []
     for i, flight in enumerate(flights, 1):
+        out_dest = flight.get("outbound_dest", "")
+        ret_origin = flight.get("return_origin", "")
+        route_note = ""
+        if out_dest and ret_origin and out_dest != ret_origin:
+            route_note = f'<span class="route-badge">fly to {out_dest}, return from {ret_origin}</span>'
         outbound_html = build_segment_html("Outbound", flight["outbound"], flight["outbound_airline"])
         inbound_html = build_segment_html("Return", flight["inbound"], flight["inbound_airline"])
         cards.append(f"""
@@ -105,6 +117,7 @@ def build_html(flights: list[dict], config: dict, search_time: str) -> str:
         <span class="rank">#{i}</span>
         <span class="price">{flight["currency"]} {flight["price"]:,.0f}</span>
         <span class="price-note">round-trip for {config["passengers"]} adults</span>
+        {route_note}
       </div>
       {outbound_html}
       {inbound_html}
@@ -117,7 +130,7 @@ def build_html(flights: list[dict], config: dict, search_time: str) -> str:
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>TLV-BKK Flight Search</title>
+<title>TLV-Thailand Flight Search</title>
 <style>
   :root {{
     --bg: #ffffff; --fg: #1a1a1a; --card-bg: #f8f9fa; --card-border: #e0e0e0;
@@ -163,14 +176,17 @@ def build_html(flights: list[dict], config: dict, search_time: str) -> str:
   .airline {{ font-weight: 600; min-width: 80px; }}
   .layover {{ font-size: 0.8rem; color: var(--fg); background: var(--layover-bg);
     padding: 0.3rem 0.6rem; border-radius: 4px; margin-top: 0.4rem; display: inline-block; }}
+  .route-badge {{ font-size: 0.75rem; color: var(--accent); background: var(--segment-bg);
+    padding: 0.2rem 0.5rem; border-radius: 4px; white-space: nowrap; }}
 </style>
 </head>
 <body>
   <div class="header">
-    <h1>TLV &rarr; BKK Cheapest Flights</h1>
+    <h1>TLV &rarr; Thailand Cheapest Flights</h1>
     <div class="meta">
       {config["departure_date"]} &rarr; {config["return_date"]} &middot;
-      {config["passengers"]} adults &middot; max {config["max_stops"].replace("_", " ").lower()} &middot;
+      {config["passengers"]} adults &middot; max {config["max_stops"].replace("_", " ").lower()}{layover_note} &middot;
+      Airports: {dest_label} &middot;
       Last updated: {search_time}
     </div>
     <a class="gf-link" href="{gf_url}" target="_blank">View on Google Flights &rarr;</a>
@@ -201,12 +217,17 @@ def send_telegram(config: dict, message: str):
 
 
 def build_telegram_message(flights: list[dict], config: dict, gf_url: str) -> str:
-    lines = [f"<b>TLV -> BKK Flight Update</b>", f"{config['departure_date']} to {config['return_date']}", ""]
+    dests = config.get("destinations", [config.get("destination", "BKK")])
+    lines = [f"<b>TLV -> Thailand Flight Update</b>", f"{config['departure_date']} to {config['return_date']} ({', '.join(dests)})", ""]
     for i, fl in enumerate(flights, 1):
         out_airline = fl["outbound_airline"]
         in_airline = fl["inbound_airline"]
         out_legs = fl["outbound"]["legs"]
         in_legs = fl["inbound"]["legs"]
+        dep_ap = out_legs[0]["departure_airport"]
+        arr_ap = out_legs[-1]["arrival_airport"]
+        ret_dep_ap = in_legs[0]["departure_airport"]
+        ret_arr_ap = in_legs[-1]["arrival_airport"]
         out_via = ""
         if fl["outbound"]["layovers"]:
             out_via = f" via {fl['outbound']['layovers'][0]['airport']}"
@@ -220,8 +241,8 @@ def build_telegram_message(flights: list[dict], config: dict, gf_url: str) -> st
         ret_arr_dt = datetime.fromisoformat(in_legs[-1]["arrival_time"])
 
         lines.append(f"<b>#{i} - {fl['currency']} {fl['price']:,.0f}</b>")
-        lines.append(f"  Out: {out_airline} {dep_dt:%H:%M}-{arr_dt:%H:%M}{out_via} ({format_duration(fl['outbound']['duration'])})")
-        lines.append(f"  Ret: {in_airline} {ret_dep_dt:%H:%M}-{ret_arr_dt:%H:%M}{in_via} ({format_duration(fl['inbound']['duration'])})")
+        lines.append(f"  Out: {out_airline} {dep_ap}->{arr_ap} {dep_dt:%H:%M}-{arr_dt:%H:%M}{out_via} ({format_duration(fl['outbound']['duration'])})")
+        lines.append(f"  Ret: {in_airline} {ret_dep_ap}->{ret_arr_ap} {ret_dep_dt:%H:%M}-{ret_arr_dt:%H:%M}{in_via} ({format_duration(fl['inbound']['duration'])})")
         lines.append("")
     lines.append(f'<a href="{gf_url}">View on Google Flights</a>')
     return "\n".join(lines)
@@ -229,24 +250,22 @@ def build_telegram_message(flights: list[dict], config: dict, gf_url: str) -> st
 
 def search():
     config = load_config()
-    log(f"Searching {config['origin']}->{config['destination']} "
+    dests = config.get("destinations", [config.get("destination", "BKK")])
+    max_layover = config.get("max_layover_minutes")
+    log(f"Searching {config['origin']}->{','.join(dests)} "
         f"{config['departure_date']} to {config['return_date']} "
-        f"({config['passengers']} pax, {config['max_stops']})")
+        f"({config['passengers']} pax, {config['max_stops']}"
+        f"{f', max {max_layover}min layover' if max_layover else ''})")
 
     serialized = None
-    for attempt in range(3):
-        try:
-            serialized = scrape(config)
-            if serialized:
-                break
-        except Exception as e:
-            log(f"Attempt {attempt + 1} failed: {e}")
-        if attempt < 2:
-            time.sleep(10 * (attempt + 1))
+    try:
+        serialized = scrape(config)
+    except Exception as e:
+        log(f"Scrape failed: {e}")
 
     if not serialized:
         log("No flights found.")
-        send_telegram(config, "TLV->BKK search: no results found. Will retry in 4h.")
+        send_telegram(config, f"TLV->Thailand search: no results found ({','.join(dests)}). Will retry in 4h.")
         return
 
     search_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -263,8 +282,14 @@ def search():
     with open(RESULTS_HTML, "w", encoding="utf-8") as f:
         f.write(html)
 
-    summary_parts = [f"#{i+1}: {fl['currency']} {fl['price']:,.0f} ({fl['outbound_airline']})" for i, fl in enumerate(serialized)]
-    summary = f"TLV->BKK {config['departure_date']}: {' | '.join(summary_parts)}"
+    def _route(fl):
+        od = fl.get("outbound_dest", "")
+        ro = fl.get("return_origin", "")
+        if od and ro and od != ro:
+            return f"{od}/{ro}"
+        return od or "?"
+    summary_parts = [f"#{i+1}: {fl['currency']} {fl['price']:,.0f} {_route(fl)} ({fl['outbound_airline']})" for i, fl in enumerate(serialized)]
+    summary = f"TLV->TH {config['departure_date']}: {' | '.join(summary_parts)}"
     log(f"Done. {summary}")
     print(f"\n{summary}")
 
