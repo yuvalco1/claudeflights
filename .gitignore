@@ -2,9 +2,13 @@
 results.html
 results.json
 search.log
+debug_*.png
 
 # Config with secrets (use config.example.json as template)
 config.json
+
+# Python
+__pycache__/
 
 # Claude Code
 .claude/

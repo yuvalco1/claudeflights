@@ -6,6 +6,8 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 
+from scrape_flights import scrape
+
 SCRIPT_DIR = Path(__file__).parent
 CONFIG_PATH = SCRIPT_DIR / "config.json"
 RESULTS_HTML = SCRIPT_DIR / "results.html"
@@ -24,64 +26,6 @@ def log(msg: str):
 def load_config() -> dict:
     with open(CONFIG_PATH, encoding="utf-8") as f:
         return json.load(f)
-
-
-def airline_code(airline) -> str:
-    return getattr(airline, "name", str(airline)).lstrip("_")
-
-
-def airport_code(airport) -> str:
-    name = getattr(airport, "name", str(airport))
-    return name.replace("Airport.", "").lstrip("_")
-
-
-def serialize_leg(leg) -> dict:
-    return {
-        "departure_airport": airport_code(leg.departure_airport),
-        "arrival_airport": airport_code(leg.arrival_airport),
-        "departure_time": str(leg.departure_datetime),
-        "arrival_time": str(leg.arrival_datetime),
-        "duration": leg.duration,
-        "airline_code": airline_code(leg.airline),
-        "flight_number": leg.flight_number,
-    }
-
-
-def serialize_layover(lo) -> dict:
-    out = {"airport": airline_code(lo.airport), "duration": lo.duration}
-    if lo.overnight:
-        out["overnight"] = True
-    return out
-
-
-def serialize_flight(flight_tuple) -> dict | None:
-    outbound, inbound = flight_tuple
-    price = outbound.price
-    if price is None:
-        return None
-    currency = outbound.currency or "USD"
-
-    out_layovers = getattr(outbound, "layovers", None)
-    in_layovers = getattr(inbound, "layovers", None)
-
-    return {
-        "price": price,
-        "currency": currency,
-        "outbound_airline": getattr(outbound, "primary_airline_name", None) or "",
-        "inbound_airline": getattr(inbound, "primary_airline_name", None) or "",
-        "outbound": {
-            "legs": [serialize_leg(leg) for leg in outbound.legs],
-            "duration": outbound.duration,
-            "stops": outbound.stops,
-            "layovers": [serialize_layover(lo) for lo in out_layovers] if out_layovers else [],
-        },
-        "inbound": {
-            "legs": [serialize_leg(leg) for leg in inbound.legs],
-            "duration": inbound.duration,
-            "stops": inbound.stops,
-            "layovers": [serialize_layover(lo) for lo in in_layovers] if in_layovers else [],
-        },
-    }
 
 
 def google_flights_url(config: dict) -> str:
@@ -284,67 +228,25 @@ def build_telegram_message(flights: list[dict], config: dict, gf_url: str) -> st
 
 
 def search():
-    from fli.core import build_flight_segments, parse_currency, parse_max_stops, parse_sort_by, resolve_airport
-    from fli.models import FlightSearchFilters, PassengerInfo
-    from fli.search import SearchFlights
-
     config = load_config()
     log(f"Searching {config['origin']}->{config['destination']} "
         f"{config['departure_date']} to {config['return_date']} "
         f"({config['passengers']} pax, {config['max_stops']})")
 
-    origins = [resolve_airport(config["origin"])]
-    destinations = [resolve_airport(config["destination"])]
-
-    segments, trip_type = build_flight_segments(
-        origin=origins,
-        destination=destinations,
-        departure_date=config["departure_date"],
-        return_date=config["return_date"],
-    )
-
-    max_stops = parse_max_stops(config["max_stops"])
-    sort_by = parse_sort_by("CHEAPEST")
-    currency = parse_currency(config.get("currency", "USD"))
-
-    filters = FlightSearchFilters(
-        trip_type=trip_type,
-        passenger_info=PassengerInfo(adults=config["passengers"]),
-        flight_segments=segments,
-        stops=max_stops,
-        sort_by=sort_by,
-    )
-
-    results = None
+    serialized = None
     for attempt in range(3):
         try:
-            client = SearchFlights()
-            results = client.search(filters, currency=currency, language="en", country="IL")
-            if results:
+            serialized = scrape(config)
+            if serialized:
                 break
         except Exception as e:
             log(f"Attempt {attempt + 1} failed: {e}")
         if attempt < 2:
             time.sleep(10 * (attempt + 1))
 
-    if not results:
-        log("No flights found (Google may be rate-limiting).")
-        send_telegram(config, "TLV->BKK search: no results (Google rate limit). Will retry in 4h.")
-        return
-
-    top_n = config.get("top_n", 3)
-    serialized = []
-    for flight in results:
-        if not isinstance(flight, tuple) or len(flight) != 2:
-            continue
-        s = serialize_flight(flight)
-        if s:
-            serialized.append(s)
-        if len(serialized) >= top_n:
-            break
-
     if not serialized:
-        log("All results had no price. Skipping.")
+        log("No flights found.")
+        send_telegram(config, "TLV->BKK search: no results found. Will retry in 4h.")
         return
 
     search_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
