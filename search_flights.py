@@ -32,7 +32,9 @@ def google_flights_url(config: dict, dest: str = None) -> str:
     if dest is None:
         dests = config.get("destinations", [config.get("destination", "BKK")])
         dest = dests[0]
-    q = f"flights from {config['origin']} to {dest} on {config['departure_date']} return {config['return_date']}"
+    dep = config.get("departure_dates", [config.get("departure_date")])[0]
+    ret = config.get("return_dates", [config.get("return_date")])[0]
+    q = f"flights from {config['origin']} to {dest} on {dep} return {ret}"
     return f"https://www.google.com/travel/flights?q={urllib.parse.quote(q)}&curr={config.get('currency', 'USD')}"
 
 
@@ -109,6 +111,9 @@ def build_html(flights: list[dict], config: dict, search_time: str) -> str:
         route_note = ""
         if out_dest and ret_origin and out_dest != ret_origin:
             route_note = f'<span class="route-badge">fly to {out_dest}, return from {ret_origin}</span>'
+        dates_note = ""
+        if flight.get("departure_date") and flight.get("return_date"):
+            dates_note = f'<span class="route-badge">{flight["departure_date"]} &rarr; {flight["return_date"]}</span>'
         outbound_html = build_segment_html("Outbound", flight["outbound"], flight["outbound_airline"])
         inbound_html = build_segment_html("Return", flight["inbound"], flight["inbound_airline"])
         cards.append(f"""
@@ -118,6 +123,7 @@ def build_html(flights: list[dict], config: dict, search_time: str) -> str:
         <span class="price">{flight["currency"]} {flight["price"]:,.0f}</span>
         <span class="price-note">round-trip for {config["passengers"]} adults</span>
         {route_note}
+        {dates_note}
       </div>
       {outbound_html}
       {inbound_html}
@@ -184,7 +190,8 @@ def build_html(flights: list[dict], config: dict, search_time: str) -> str:
   <div class="header">
     <h1>TLV &rarr; Thailand Cheapest Flights</h1>
     <div class="meta">
-      {config["departure_date"]} &rarr; {config["return_date"]} &middot;
+      Depart: {", ".join(config.get("departure_dates", [config.get("departure_date")]))} &middot;
+      Return: {", ".join(config.get("return_dates", [config.get("return_date")]))} &middot;
       {config["passengers"]} adults &middot; max {config["max_stops"].replace("_", " ").lower()}{layover_note} &middot;
       Airports: {dest_label} &middot;
       Last updated: {search_time}
@@ -218,7 +225,9 @@ def send_telegram(config: dict, message: str):
 
 def build_telegram_message(flights: list[dict], config: dict, gf_url: str) -> str:
     dests = config.get("destinations", [config.get("destination", "BKK")])
-    lines = [f"<b>TLV -> Thailand Flight Update</b>", f"{config['departure_date']} to {config['return_date']} ({', '.join(dests)})", ""]
+    dep_dates = config.get("departure_dates", [config.get("departure_date")])
+    ret_dates = config.get("return_dates", [config.get("return_date")])
+    lines = [f"<b>TLV -> Thailand Flight Update</b>", f"Dep: {', '.join(dep_dates)} | Ret: {', '.join(ret_dates)} ({', '.join(dests)})", ""]
     for i, fl in enumerate(flights, 1):
         out_airline = fl["outbound_airline"]
         in_airline = fl["inbound_airline"]
@@ -240,7 +249,10 @@ def build_telegram_message(flights: list[dict], config: dict, gf_url: str) -> st
         ret_dep_dt = datetime.fromisoformat(in_legs[0]["departure_time"])
         ret_arr_dt = datetime.fromisoformat(in_legs[-1]["arrival_time"])
 
-        lines.append(f"<b>#{i} - {fl['currency']} {fl['price']:,.0f}</b>")
+        date_info = ""
+        if fl.get("departure_date") and fl.get("return_date"):
+            date_info = f" ({fl['departure_date']} -> {fl['return_date']})"
+        lines.append(f"<b>#{i} - {fl['currency']} {fl['price']:,.0f}{date_info}</b>")
         lines.append(f"  Out: {out_airline} {dep_ap}->{arr_ap} {dep_dt:%H:%M}-{arr_dt:%H:%M}{out_via} ({format_duration(fl['outbound']['duration'])})")
         lines.append(f"  Ret: {in_airline} {ret_dep_ap}->{ret_arr_ap} {ret_dep_dt:%H:%M}-{ret_arr_dt:%H:%M}{in_via} ({format_duration(fl['inbound']['duration'])})")
         lines.append("")
@@ -251,11 +263,14 @@ def build_telegram_message(flights: list[dict], config: dict, gf_url: str) -> st
 def search():
     config = load_config()
     dests = config.get("destinations", [config.get("destination", "BKK")])
+    dep_dates = config.get("departure_dates", [config.get("departure_date")])
+    ret_dates = config.get("return_dates", [config.get("return_date")])
     max_layover = config.get("max_layover_minutes")
+    n_combos = len(dests) ** 2 * len(dep_dates) * len(ret_dates)
     log(f"Searching {config['origin']}->{','.join(dests)} "
-        f"{config['departure_date']} to {config['return_date']} "
+        f"dep={','.join(dep_dates)} ret={','.join(ret_dates)} "
         f"({config['passengers']} pax, {config['max_stops']}"
-        f"{f', max {max_layover}min layover' if max_layover else ''})")
+        f"{f', max {max_layover}min layover' if max_layover else ''}, {n_combos} combos)")
 
     serialized = None
     try:
@@ -265,7 +280,7 @@ def search():
 
     if not serialized:
         log("No flights found.")
-        send_telegram(config, f"TLV->Thailand search: no results found ({','.join(dests)}). Will retry in 4h.")
+        send_telegram(config, f"TLV->Thailand search: no results found ({','.join(dests)}, {n_combos} combos). Will retry in 4h.")
         return
 
     search_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -288,8 +303,14 @@ def search():
         if od and ro and od != ro:
             return f"{od}/{ro}"
         return od or "?"
-    summary_parts = [f"#{i+1}: {fl['currency']} {fl['price']:,.0f} {_route(fl)} ({fl['outbound_airline']})" for i, fl in enumerate(serialized)]
-    summary = f"TLV->TH {config['departure_date']}: {' | '.join(summary_parts)}"
+    def _dates(fl):
+        d = fl.get("departure_date", "")
+        r = fl.get("return_date", "")
+        if d and r:
+            return f"{d}/{r}"
+        return ""
+    summary_parts = [f"#{i+1}: {fl['currency']} {fl['price']:,.0f} {_route(fl)} {_dates(fl)} ({fl['outbound_airline']})" for i, fl in enumerate(serialized)]
+    summary = f"TLV->TH: {' | '.join(summary_parts)}"
     log(f"Done. {summary}")
     print(f"\n{summary}")
 

@@ -1,8 +1,8 @@
 {
   "origin": "TLV",
   "destinations": ["BKK", "HKT", "DMK", "CNX", "KBV"],
-  "departure_date": "2027-04-09",
-  "return_date": "2027-04-23",
+  "departure_dates": ["2027-04-08", "2027-04-09"],
+  "return_dates": ["2027-04-22", "2027-04-23", "2027-04-24", "2027-04-25"],
   "passengers": 2,
   "max_stops": "ONE_STOP",
   "max_layover_minutes": 300,

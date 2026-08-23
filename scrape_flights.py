@@ -20,15 +20,13 @@ AIRPORT_ENTITIES = {
 def scrape(config: dict) -> list[dict]:
     origin = config["origin"]
     destinations = config.get("destinations", [config.get("destination", "BKK")])
-    dep_date = config["departure_date"]
-    ret_date = config["return_date"]
+    dep_dates = config.get("departure_dates", [config.get("departure_date")])
+    ret_dates = config.get("return_dates", [config.get("return_date")])
     passengers = config.get("passengers", 1)
     max_stops = _max_stops_int(config.get("max_stops", "ANY"))
     max_layover = config.get("max_layover_minutes")
     currency = config.get("currency", "USD")
     top_n = config.get("top_n", 3)
-    dep_year = int(dep_date[:4])
-    ret_year = int(ret_date[:4])
 
     with sync_playwright() as pw:
         browser = pw.chromium.launch(
@@ -49,13 +47,21 @@ def scrape(config: dict) -> list[dict]:
             "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
         )
         try:
-            combos = [(od, ro) for od in destinations for ro in destinations]
+            combos = [
+                (od, ro, dd, rd)
+                for dd in dep_dates
+                for rd in ret_dates
+                for od in destinations
+                for ro in destinations
+            ]
             total = len(combos)
             all_results = []
             consent_dismissed = False
 
-            for idx, (out_dest, ret_origin) in enumerate(combos):
-                print(f"  [{idx+1}/{total}] {origin}->{out_dest} / {ret_origin}->{origin}...", end="", flush=True)
+            for idx, (out_dest, ret_origin, dep_date, ret_date) in enumerate(combos):
+                dep_year = int(dep_date[:4])
+                ret_year = int(ret_date[:4])
+                print(f"  [{idx+1}/{total}] {dep_date}/{ret_date} {origin}->{out_dest} / {ret_origin}->{origin}...", end="", flush=True)
 
                 try:
                     result = _search_combo(
@@ -71,6 +77,8 @@ def scrape(config: dict) -> list[dict]:
                     continue
 
                 if result:
+                    result["departure_date"] = dep_date
+                    result["return_date"] = ret_date
                     all_results.append(result)
                     print(f" ${result['price']} ({result['outbound_airline']}/{result['inbound_airline']})")
                 else:
@@ -430,9 +438,12 @@ if __name__ == "__main__":
         cfg = json.load(f)
 
     dests = cfg.get("destinations", [cfg.get("destination", "BKK")])
+    dep_dates = cfg.get("departure_dates", [cfg.get("departure_date")])
+    ret_dates = cfg.get("return_dates", [cfg.get("return_date")])
+    n_combos = len(dests) ** 2 * len(dep_dates) * len(ret_dates)
     print(f"Scraping flights: {cfg['origin']}->{','.join(dests)} "
-          f"{cfg['departure_date']} to {cfg['return_date']} "
-          f"({len(dests)}x{len(dests)}={len(dests)**2} combos)...")
+          f"dep={','.join(dep_dates)} ret={','.join(ret_dates)} "
+          f"({n_combos} combos)...")
 
     flights = scrape(cfg)
     if flights:
