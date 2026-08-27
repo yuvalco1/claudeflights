@@ -1,20 +1,19 @@
-"""Playwright-based Google Flights scraper using multi-city search."""
+"""Playwright-based Kayak scraper for flight search."""
 
-import base64
 import json
 import re
-import sys
 import time
 import random
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 
-
-AIRPORT_ENTITIES = {
-    "TLV": "/m/07qzv",
-}
+try:
+    from playwright_stealth import Stealth
+    _stealth = Stealth()
+except ImportError:
+    _stealth = None
 
 
 def scrape(config: dict) -> list[dict]:
@@ -42,10 +41,10 @@ def scrape(config: dict) -> list[dict]:
                 "Chrome/131.0.0.0 Safari/537.36"
             ),
         )
+        if _stealth:
+            _stealth.apply_stealth_sync(ctx)
         page = ctx.new_page()
-        page.add_init_script(
-            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
-        )
+
         try:
             combos = [
                 (od, ro, dd, rd)
@@ -56,21 +55,16 @@ def scrape(config: dict) -> list[dict]:
             ]
             total = len(combos)
             all_results = []
-            consent_dismissed = False
 
             for idx, (out_dest, ret_origin, dep_date, ret_date) in enumerate(combos):
-                dep_year = int(dep_date[:4])
-                ret_year = int(ret_date[:4])
                 print(f"  [{idx+1}/{total}] {dep_date}/{ret_date} {origin}->{out_dest} / {ret_origin}->{origin}...", end="", flush=True)
 
                 try:
                     result = _search_combo(
                         page, origin, out_dest, ret_origin,
                         dep_date, ret_date, passengers, max_stops,
-                        max_layover, currency, dep_year, ret_year,
-                        dismiss_consent=not consent_dismissed,
+                        max_layover, currency,
                     )
-                    consent_dismissed = True
                 except Exception as e:
                     print(f" error: {e}")
                     _pause(10, 20)
@@ -94,63 +88,36 @@ def scrape(config: dict) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Protobuf URL builder — constructs tfs parameter for Google Flights
+# URL builder
 # ---------------------------------------------------------------------------
 
-def _varint(value):
-    result = bytearray()
-    while value > 0x7F:
-        result.append((value & 0x7F) | 0x80)
-        value >>= 7
-    result.append(value & 0x7F)
-    return bytes(result)
+def _build_url(origin, out_dest, ret_origin, dep_date, ret_date,
+               passengers, max_stops, max_layover, currency):
+    path = f"/flights/{origin}-{out_dest}/{dep_date}/{ret_origin}-{origin}/{ret_date}"
+    params = [f"sort=price_a", f"adults={passengers}"]
+    filters = []
+    if max_stops is not None:
+        filters.append(f"stops=~{max_stops}")
+    if max_layover is not None:
+        filters.append(f"connDur=-{max_layover}")
+    if filters:
+        params.append(f"fs={';'.join(filters)}")
+    if currency:
+        params.append(f"currency={currency}")
+    return f"https://www.kayak.com{path}?{'&'.join(params)}"
 
 
-def _pb_tag(field, wire_type):
-    return _varint((field << 3) | wire_type)
-
-
-def _pb_varint(field, value):
-    return _pb_tag(field, 0) + _varint(value)
-
-
-def _pb_bytes(field, data):
-    return _pb_tag(field, 2) + _varint(len(data)) + data
-
-
-def _pb_string(field, s):
-    return _pb_bytes(field, s.encode("utf-8"))
-
-
-def _encode_airport(field_num, iata):
-    entity = AIRPORT_ENTITIES.get(iata)
-    if entity:
-        inner = _pb_varint(1, 2) + _pb_string(2, entity)
-    else:
-        inner = _pb_varint(1, 1) + _pb_string(2, iata)
-    return _pb_bytes(field_num, inner)
-
-
-def _build_tfs(dep_date, ret_date, origin, out_dest, ret_origin, passengers=1):
-    tfs = b""
-    tfs += _pb_varint(1, 28)
-    tfs += _pb_varint(2, 2)  # multi-city
-    seg1 = _pb_string(2, dep_date) + _encode_airport(13, origin) + _encode_airport(14, out_dest)
-    tfs += _pb_bytes(3, seg1)
-    seg2 = _pb_string(2, ret_date) + _encode_airport(13, ret_origin) + _encode_airport(14, origin)
-    tfs += _pb_bytes(3, seg2)
-    tfs += _pb_varint(8, 1)
-    tfs += _pb_varint(9, 1)
-    tfs += _pb_varint(14, 1)
-    pax_inner = _pb_varint(1, 0xFFFFFFFFFFFFFFFF)
-    tfs += _pb_bytes(16, pax_inner)
-    tfs += _pb_varint(19, passengers + 1)
-    return base64.urlsafe_b64encode(tfs).rstrip(b"=").decode()
-
-
-def _build_search_url(dep_date, ret_date, origin, out_dest, ret_origin, passengers=1, currency="USD"):
-    tfs = _build_tfs(dep_date, ret_date, origin, out_dest, ret_origin, passengers)
-    return f"https://www.google.com/travel/flights/search?tfs={tfs}&tfu=KgIIAw&hl=en&curr={currency}"
+def kayak_url(config: dict, dest: str = None) -> str:
+    """Build a human-friendly Kayak search URL for the report."""
+    origin = config["origin"]
+    if dest is None:
+        dests = config.get("destinations", [config.get("destination", "BKK")])
+        dest = dests[0]
+    dep = config.get("departure_dates", [config.get("departure_date")])[0]
+    ret = config.get("return_dates", [config.get("return_date")])[0]
+    passengers = config.get("passengers", 1)
+    currency = config.get("currency", "USD")
+    return f"https://www.kayak.com/flights/{origin}-{dest}/{dep}/{dest}-{origin}/{ret}?sort=price_a&adults={passengers}&currency={currency}"
 
 
 # ---------------------------------------------------------------------------
@@ -161,10 +128,14 @@ def _pause(lo=0.5, hi=1.5):
     time.sleep(random.uniform(lo, hi))
 
 
+def _max_stops_int(val: str) -> int | None:
+    return {"NONSTOP": 0, "ONE_STOP": 1, "TWO_STOPS": 2}.get(val)
+
+
 def _parse_duration(text: str) -> int:
     hours = minutes = 0
-    h = re.search(r"(\d+)\s*hr", text)
-    m = re.search(r"(\d+)\s*min", text)
+    h = re.search(r"(\d+)\s*h", text)
+    m = re.search(r"(\d+)\s*m", text)
     if h:
         hours = int(h.group(1))
     if m:
@@ -172,262 +143,262 @@ def _parse_duration(text: str) -> int:
     return hours * 60 + minutes
 
 
-def _build_datetime(time_str: str, date_str: str, year: int) -> str:
+def _parse_time_12h(time_str: str) -> str:
+    """Convert '12:55 am' or '6:20 pm' to '00:55' or '18:20'."""
+    time_str = time_str.strip().replace(" ", " ")
+    m = re.match(r"(\d{1,2}):(\d{2})\s*(am|pm)", time_str, re.I)
+    if not m:
+        return time_str
+    hour, minute, period = int(m.group(1)), m.group(2), m.group(3).lower()
+    if period == "am" and hour == 12:
+        hour = 0
+    elif period == "pm" and hour != 12:
+        hour += 12
+    return f"{hour:02d}:{minute}"
+
+
+def _build_datetime(time_24h: str, date_str: str, extra_days: int = 0) -> str:
     try:
-        full = f"{date_str}, {year} {time_str}"
-        dt = datetime.strptime(full, "%B %d, %Y %I:%M %p")
+        dt = datetime.strptime(f"{date_str} {time_24h}", "%Y-%m-%d %H:%M")
+        if extra_days:
+            dt += timedelta(days=extra_days)
         return dt.strftime("%Y-%m-%dT%H:%M")
     except ValueError:
         return ""
 
 
-def _max_stops_int(val: str) -> int | None:
-    return {"NONSTOP": 0, "ONE_STOP": 1, "TWO_STOPS": 2}.get(val)
-
-
-def _dismiss_consent(page):
-    for label in ("Reject all", "Accept all"):
-        try:
-            btn = page.locator(f'button:has-text("{label}")').first
-            if btn.is_visible(timeout=2000):
-                btn.click()
-                _pause(0.5, 1)
-                return
-        except Exception:
-            continue
-
-
-def _set_passengers(page, count: int):
-    pax_btn = page.locator("button").filter(
-        has_text=re.compile(r"\d+\s*(?:passenger|adult)")
-    )
-    if pax_btn.count() == 0:
-        return False
-    pax_btn.first.click()
-    _pause(0.3, 0.5)
-    add_btn = page.get_by_label("Add adult")
-    for _ in range(count - 1):
-        if add_btn.count() > 0:
-            add_btn.first.click()
-            _pause(0.15, 0.25)
-    done = page.locator("button").filter(has_text="Done")
-    if done.count() > 0:
-        done.first.click()
-    _pause(0.3, 0.5)
-    return True
-
-
-def _wait_for_results(page, timeout=15000):
-    for attempt in range(3):
-        try:
-            page.wait_for_selector("li.pIav2d", timeout=timeout)
-            return True
-        except PlaywrightTimeout:
-            oops = page.locator("text=Oops, something went wrong")
-            reload_btn = page.locator("button:has-text('Reload')")
-            if oops.count() > 0 and reload_btn.count() > 0:
-                reload_btn.first.click()
-                _pause(2, 3)
-            else:
-                page.reload()
-                _pause(2, 3)
-    return False
-
-
 # ---------------------------------------------------------------------------
-# Result extraction
-# ---------------------------------------------------------------------------
-
-_JS_EXTRACT = """() => {
-    const cards = document.querySelectorAll('li.pIav2d');
-    return Array.from(cards).map(card => {
-        const link = card.querySelector('.JMc5Xc');
-        const priceEl = card.querySelector('.U3gSDe');
-        const airports = card.querySelectorAll('.QylvBf');
-        const layoverEls = card.querySelectorAll('[aria-label^="Layover"]');
-        const layoverCodes = Array.from(layoverEls).map(el => {
-            for (const ch of el.querySelectorAll('*')) {
-                const t = ch.textContent.trim();
-                if (t.length === 3 && /^[A-Z]{3}$/.test(t)) return t;
-            }
-            return '';
-        });
-        const rawDep = airports[0]?.textContent?.trim() || '';
-        const rawArr = airports[1]?.textContent?.trim() || '';
-        return {
-            ariaLabel: link ? link.getAttribute('aria-label') || '' : '',
-            priceText: priceEl ? priceEl.textContent || '' : '',
-            depCode: (rawDep.match(/^([A-Z]{3})/) || [])[1] || rawDep,
-            arrCode: (rawArr.match(/^([A-Z]{3})/) || [])[1] || rawArr,
-            layoverCodes,
-        };
-    });
-}"""
-
-
-def _extract_flights(page, max_stops, year, max_layover=None):
-    raw = page.evaluate(_JS_EXTRACT)
-    flights = []
-    for item in raw:
-        parsed = _parse_card(item, year)
-        if parsed is None:
-            continue
-        if max_stops is not None and parsed["stops"] > max_stops:
-            continue
-        if max_layover is not None and parsed["layovers"]:
-            if any(lo["duration"] > max_layover for lo in parsed["layovers"]):
-                continue
-        flights.append(parsed)
-    flights.sort(key=lambda f: f["total_price"])
-    return flights
-
-
-def _parse_card(item: dict, year: int) -> dict | None:
-    label = item.get("ariaLabel", "")
-    if not label:
-        return None
-
-    pm = re.search(r"From ([\d,]+)", label)
-    if not pm:
-        pm = re.search(r"([\d,]+)", item.get("priceText", ""))
-    if not pm:
-        return None
-    total_price = int(pm.group(1).replace(",", ""))
-
-    stops = 0
-    sm = re.search(r"(\d+) stops? flight", label)
-    if sm:
-        stops = int(sm.group(1))
-
-    airline = ""
-    am = re.search(r"flight with (.+?)\.\s*(?:Leaves|Select)", label)
-    if am:
-        airline = am.group(1)
-
-    dep_dt = ""
-    dm = re.search(
-        r"Leaves .+? at (\d+:\d+ [AP]M) on \w+day, (\w+ \d+)", label
-    )
-    if dm:
-        dep_dt = _build_datetime(dm.group(1), dm.group(2), year)
-
-    arr_dt = ""
-    arm = re.search(
-        r"arrives at .+? at (\d+:\d+ [AP]M) on \w+day, (\w+ \d+)", label
-    )
-    if arm:
-        arr_dt = _build_datetime(arm.group(1), arm.group(2), year)
-
-    duration = 0
-    drm = re.search(r"Total duration (.+?)\.", label)
-    if drm:
-        duration = _parse_duration(drm.group(1))
-
-    lo_codes = item.get("layoverCodes", [])
-    layovers = []
-    for i, lm in enumerate(
-        re.finditer(r"Layover \(\d+ of \d+\) is a (.+?) layover at", label)
-    ):
-        lo_dur = _parse_duration(lm.group(1))
-        code = lo_codes[i] if i < len(lo_codes) else ""
-        layovers.append({"airport": code, "duration": lo_dur})
-
-    return {
-        "total_price": total_price,
-        "stops": stops,
-        "airline": airline,
-        "dep_code": item.get("depCode", ""),
-        "arr_code": item.get("arrCode", ""),
-        "dep_datetime": dep_dt,
-        "arr_datetime": arr_dt,
-        "duration": duration,
-        "layovers": layovers,
-    }
-
-
-def _build_segment(flight: dict) -> dict:
-    return {
-        "legs": [
-            {
-                "departure_airport": flight["dep_code"],
-                "arrival_airport": flight["arr_code"],
-                "departure_time": flight["dep_datetime"],
-                "arrival_time": flight["arr_datetime"],
-                "duration": flight["duration"],
-                "airline_code": flight["airline"],
-                "flight_number": "",
-            }
-        ],
-        "duration": flight["duration"],
-        "stops": flight["stops"],
-        "layovers": flight["layovers"],
-    }
-
-
-# ---------------------------------------------------------------------------
-# Search one destination combination
+# Search one combo
 # ---------------------------------------------------------------------------
 
 def _search_combo(page, origin, out_dest, ret_origin,
                   dep_date, ret_date, passengers, max_stops,
-                  max_layover, currency, dep_year, ret_year,
-                  dismiss_consent=True):
-    url = _build_search_url(dep_date, ret_date, origin, out_dest, ret_origin, passengers, currency)
+                  max_layover, currency):
+    url = _build_url(origin, out_dest, ret_origin, dep_date, ret_date,
+                     passengers, max_stops, max_layover, currency)
     try:
-        page.goto(url, wait_until="networkidle", timeout=30000)
+        page.goto(url, wait_until="domcontentloaded", timeout=30000)
     except PlaywrightTimeout:
-        try:
-            page.wait_for_load_state("domcontentloaded", timeout=10000)
-        except Exception:
-            return None
-    _pause(2, 3)
-
-    if dismiss_consent:
-        _dismiss_consent(page)
-
-    if not _wait_for_results(page):
         return None
 
-    if passengers > 1:
-        if _set_passengers(page, passengers):
-            page.wait_for_load_state("networkidle", timeout=15000)
-            _pause(2, 3)
-            _wait_for_results(page)
+    _pause(2, 3)
+
+    # Wait for result cards
+    try:
+        page.wait_for_selector(".nrc6", timeout=30000)
+    except PlaywrightTimeout:
+        return None
+
+    # Wait for search to complete (Kayak shows "Done" when finished)
+    for _ in range(10):
+        done = page.locator("text=Done").first
+        comparing = page.locator("text=Comparing flight sites")
+        if done.is_visible() or comparing.count() == 0:
+            break
+        _pause(2, 3)
 
     _pause(1, 2)
 
-    outbound_flights = _extract_flights(page, max_stops, dep_year, max_layover)
-    if not outbound_flights:
+    # Extract cards and find cheapest that passes filters
+    cards = page.locator(".nrc6")
+    count = min(cards.count(), 10)
+    if count == 0:
         return None
 
-    cards = page.locator("li.pIav2d")
-    if cards.count() == 0:
+    for i in range(count):
+        card_text = cards.nth(i).evaluate("el => el.innerText")
+        result = _parse_card(card_text, out_dest, ret_origin, dep_date, ret_date, currency)
+        if not result:
+            continue
+        if max_stops is not None:
+            if result["outbound"]["stops"] > max_stops or result["inbound"]["stops"] > max_stops:
+                continue
+        if max_layover is not None:
+            out_lo = result["outbound"]["layovers"]
+            in_lo = result["inbound"]["layovers"]
+            if any(lo["duration"] > max_layover for lo in out_lo + in_lo):
+                continue
+        return result
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Card parsing
+# ---------------------------------------------------------------------------
+
+def _parse_card(text, out_dest, ret_origin, dep_date, ret_date, currency):
+    """Parse a Kayak flight card's innerText into structured data."""
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
+    if len(lines) < 10:
         return None
 
-    cards.first.click(force=True)
-    _pause(3, 4)
-
-    try:
-        page.wait_for_selector("li.pIav2d", timeout=15000)
-    except PlaywrightTimeout:
+    # Find price (line matching currency pattern)
+    price = 0
+    actual_currency = currency
+    for line in reversed(lines):
+        m = re.match(r"[₪$€£]([\d,]+)", line)
+        if m:
+            price = int(m.group(1).replace(",", ""))
+            sym = line[0]
+            actual_currency = {"₪": "ILS", "$": "USD", "€": "EUR", "£": "GBP"}.get(sym, currency)
+            break
+    if not price:
         return None
 
-    return_flights = _extract_flights(page, max_stops, ret_year, max_layover)
-    if not return_flights:
+    # Find time lines (contain am/pm with · separator or standalone)
+    time_indices = []
+    for i, line in enumerate(lines):
+        if re.search(r"\d{1,2}:\d{2}\s*(?:am|pm)", line, re.I):
+            time_indices.append(i)
+
+    if len(time_indices) < 2:
         return None
 
-    out = outbound_flights[0]
-    ret = return_flights[0]
+    # Parse two legs starting from each time line
+    outbound = _parse_leg(lines, time_indices[0], dep_date)
+    inbound = _parse_leg(lines, time_indices[1], ret_date)
+
+    if not outbound or not inbound:
+        return None
 
     return {
-        "price": ret["total_price"],
-        "currency": currency,
+        "price": price,
+        "currency": actual_currency,
         "outbound_dest": out_dest,
         "return_origin": ret_origin,
-        "outbound_airline": out["airline"],
-        "inbound_airline": ret["airline"],
-        "outbound": _build_segment(out),
-        "inbound": _build_segment(ret),
+        "outbound_airline": outbound["airline"],
+        "inbound_airline": inbound["airline"],
+        "outbound": _build_segment(outbound),
+        "inbound": _build_segment(inbound),
+    }
+
+
+def _parse_leg(lines, start_idx, date_str):
+    """Parse one leg from the card lines starting at start_idx."""
+    try:
+        time_line = lines[start_idx]
+        parts = re.split(r"\s*[·–—]\s*", time_line)
+        if len(parts) < 2:
+            parts = re.findall(r"\d{1,2}:\d{2}\s*(?:am|pm)(?:\s*\+\d+)?", time_line, re.I)
+        if len(parts) < 2:
+            return None
+
+        dep_raw = parts[0].strip()
+        arr_raw = parts[1].strip()
+
+        extra_days = 0
+        day_match = re.search(r"\+(\d+)", arr_raw)
+        if day_match:
+            extra_days = int(day_match.group(1))
+            arr_raw = re.sub(r"\s*\+\d+", "", arr_raw)
+
+        dep_24 = _parse_time_12h(dep_raw)
+        arr_24 = _parse_time_12h(arr_raw)
+
+        dep_dt = _build_datetime(dep_24, date_str)
+        arr_dt = _build_datetime(arr_24, date_str, extra_days)
+
+        # Parse remaining lines for this leg
+        i = start_idx + 1
+        airline = ""
+        stops = 0
+        layovers = []
+        duration = 0
+        dep_airport = ""
+        arr_airport = ""
+
+        while i < len(lines):
+            line = lines[i]
+
+            # Airline line: not a time, not a price, not a code, not a duration
+            if not airline and not re.match(r"^\d", line) and not re.match(r"^[A-Z]{3}$", line) and not re.match(r"^[₪$€£]", line) and not re.search(r"stop", line, re.I) and not re.search(r"nonstop", line, re.I) and not re.search(r"\d+h\s*\d+m", line) and not re.search(r"layover", line, re.I) and line != "-" and len(line) > 3:
+                airline = line
+                i += 1
+                continue
+
+            # Stops line
+            if re.search(r"(\d+)\s*stop", line, re.I):
+                stops = int(re.search(r"(\d+)", line).group(1))
+                i += 1
+                continue
+            if re.search(r"nonstop", line, re.I):
+                stops = 0
+                i += 1
+                continue
+
+            # Layover airport code (3-letter code after stops, before duration)
+            if re.match(r"^[A-Z]{3}$", line) and stops > 0 and duration == 0 and len(layovers) < stops:
+                lo_airport = line
+                i += 1
+                # Next line should be layover duration
+                if i < len(lines) and re.search(r"layover", lines[i], re.I):
+                    lo_dur_match = re.search(r"(\d+h\s*\d+m)", lines[i])
+                    lo_dur = _parse_duration(lo_dur_match.group(1)) if lo_dur_match else 0
+                    layovers.append({"airport": lo_airport, "duration": lo_dur})
+                    i += 1
+                continue
+
+            # Duration line
+            dur_match = re.match(r"^(\d+h\s*\d+m)$", line)
+            if dur_match:
+                duration = _parse_duration(dur_match.group(1))
+                i += 1
+                continue
+
+            # Departure airport (3-letter code after duration)
+            if re.match(r"^[A-Z]{3}$", line) and duration > 0 and not dep_airport:
+                dep_airport = line
+                i += 1
+                continue
+
+            # Separator
+            if line == "-":
+                i += 1
+                continue
+
+            # Arrival airport (3-letter code after separator)
+            if re.match(r"^[A-Z]{3}$", line) and dep_airport and not arr_airport:
+                arr_airport = line
+                i += 1
+                break
+
+            # Next time line means we've gone too far
+            if re.search(r"\d{1,2}:\d{2}\s*(?:am|pm)", line, re.I):
+                break
+
+            i += 1
+
+        return {
+            "dep_time": dep_dt,
+            "arr_time": arr_dt,
+            "airline": airline,
+            "stops": stops,
+            "layovers": layovers,
+            "duration": duration,
+            "dep_airport": dep_airport,
+            "arr_airport": arr_airport,
+        }
+    except Exception:
+        return None
+
+
+def _build_segment(leg: dict) -> dict:
+    return {
+        "legs": [
+            {
+                "departure_airport": leg["dep_airport"],
+                "arrival_airport": leg["arr_airport"],
+                "departure_time": leg["dep_time"],
+                "arrival_time": leg["arr_time"],
+                "duration": leg["duration"],
+                "airline_code": leg["airline"],
+                "flight_number": "",
+            }
+        ],
+        "duration": leg["duration"],
+        "stops": leg["stops"],
+        "layovers": leg["layovers"],
     }
 
 

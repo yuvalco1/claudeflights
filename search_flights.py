@@ -6,7 +6,7 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 
-from scrape_flights import scrape
+from scrape_flights import scrape, kayak_url
 
 SCRIPT_DIR = Path(__file__).parent
 CONFIG_PATH = SCRIPT_DIR / "config.json"
@@ -28,14 +28,8 @@ def load_config() -> dict:
         return json.load(f)
 
 
-def google_flights_url(config: dict, dest: str = None) -> str:
-    if dest is None:
-        dests = config.get("destinations", [config.get("destination", "BKK")])
-        dest = dests[0]
-    dep = config.get("departure_dates", [config.get("departure_date")])[0]
-    ret = config.get("return_dates", [config.get("return_date")])[0]
-    q = f"flights from {config['origin']} to {dest} on {dep} return {ret}"
-    return f"https://www.google.com/travel/flights?q={urllib.parse.quote(q)}&curr={config.get('currency', 'USD')}"
+def flights_search_url(config: dict, dest: str = None) -> str:
+    return kayak_url(config, dest)
 
 
 def format_duration(minutes: int) -> str:
@@ -101,7 +95,7 @@ def build_segment_html(label: str, segment: dict, airline_name: str) -> str:
 def build_html(flights: list[dict], config: dict, search_time: str) -> str:
     dests = config.get("destinations", [config.get("destination", "BKK")])
     dest_label = ", ".join(dests)
-    gf_url = google_flights_url(config)
+    gf_url = flights_search_url(config)
     max_layover = config.get("max_layover_minutes")
     layover_note = f" &middot; max {max_layover // 60}h layover" if max_layover else ""
     cards = []
@@ -136,7 +130,7 @@ def build_html(flights: list[dict], config: dict, search_time: str) -> str:
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>TLV-Thailand Flight Search</title>
+<title>TLV-Thailand Flight Search (Kayak)</title>
 <style>
   :root {{
     --bg: #ffffff; --fg: #1a1a1a; --card-bg: #f8f9fa; --card-border: #e0e0e0;
@@ -196,7 +190,7 @@ def build_html(flights: list[dict], config: dict, search_time: str) -> str:
       Airports: {dest_label} &middot;
       Last updated: {search_time}
     </div>
-    <a class="gf-link" href="{gf_url}" target="_blank">View on Google Flights &rarr;</a>
+    <a class="gf-link" href="{gf_url}" target="_blank">View on Kayak &rarr;</a>
   </div>
   {cards_html}
 </body>
@@ -256,7 +250,7 @@ def build_telegram_message(flights: list[dict], config: dict, gf_url: str) -> st
         lines.append(f"  Out: {out_airline} {dep_ap}->{arr_ap} {dep_dt:%H:%M}-{arr_dt:%H:%M}{out_via} ({format_duration(fl['outbound']['duration'])})")
         lines.append(f"  Ret: {in_airline} {ret_dep_ap}->{ret_arr_ap} {ret_dep_dt:%H:%M}-{ret_arr_dt:%H:%M}{in_via} ({format_duration(fl['inbound']['duration'])})")
         lines.append("")
-    lines.append(f'<a href="{gf_url}">View on Google Flights</a>')
+    lines.append(f'<a href="{gf_url}">View on Kayak</a>')
     return "\n".join(lines)
 
 
@@ -314,7 +308,7 @@ def search():
     log(f"Done. {summary}")
     print(f"\n{summary}")
 
-    gf_url = google_flights_url(config)
+    gf_url = flights_search_url(config)
     telegram_msg = build_telegram_message(serialized, config, gf_url)
     send_telegram(config, telegram_msg)
 

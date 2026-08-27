@@ -1,6 +1,6 @@
 {
   "origin": "TLV",
-  "destinations": ["BKK", "HKT", "DMK", "CNX", "KBV"],
+  "destinations": ["BKK", "HKT", "DMK"],
   "departure_dates": ["2027-04-08", "2027-04-09"],
   "return_dates": ["2027-04-22", "2027-04-23", "2027-04-24", "2027-04-25"],
   "passengers": 2,
